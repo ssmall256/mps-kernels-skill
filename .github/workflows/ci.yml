@@ -1,0 +1,137 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  static-checks:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install lint/type tooling
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "ruff>=0.4" "mypy>=1.8"
+      - name: Ruff lint
+        run: python -m ruff check skill
+      - name: Mypy type check
+        run: python -m mypy skill
+      - name: Compile Python sources
+        run: python -m compileall -q skill/kernels skill/scripts skill/tests
+      - name: Verify manifest is sorted and complete
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import sys
+
+          skill_root = Path("skill")
+          manifest_path = skill_root / "manifest.txt"
+          manifest = [
+              line.strip()
+              for line in manifest_path.read_text(encoding="utf-8").splitlines()
+              if line.strip() and not line.lstrip().startswith("#")
+          ]
+          if manifest != sorted(manifest):
+              print("manifest.txt must be sorted lexicographically")
+              sys.exit(1)
+
+          expected = []
+          for path in skill_root.rglob("*"):
+              if not path.is_file():
+                  continue
+              rel = path.relative_to(skill_root)
+              if "__pycache__" in rel.parts:
+                  continue
+              if rel.suffix in {".pyc", ".pyo"}:
+                  continue
+              expected.append(rel.as_posix())
+          expected = sorted(expected)
+
+          if manifest != expected:
+              print("manifest mismatch")
+              missing = sorted(set(expected) - set(manifest))
+              extra = sorted(set(manifest) - set(expected))
+              if missing:
+                  print("Missing entries:")
+                  for item in missing:
+                      print(f"  - {item}")
+              if extra:
+                  print("Unexpected entries:")
+                  for item in extra:
+                      print(f"  - {item}")
+              sys.exit(1)
+          PY
+      - name: Build wheel
+        run: python -m pip wheel --no-build-isolation --no-deps --wheel-dir /tmp/dist .
+      - name: Verify wheel includes skill docs
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import sys
+          import zipfile
+
+          wheels = sorted(Path("/tmp/dist").glob("mps_kernels_skill-*.whl"))
+          if not wheels:
+              print("No wheel produced")
+              sys.exit(1)
+
+          wheel = wheels[-1]
+          required = {
+              "skill/SKILL.md",
+              "skill/manifest.txt",
+              "skill/references/mps-kernel-patterns.md",
+          }
+          with zipfile.ZipFile(wheel) as zf:
+              names = set(zf.namelist())
+          missing = sorted(required - names)
+          if missing:
+              print(f"Wheel missing required files: {missing}")
+              sys.exit(1)
+          PY
+      - name: Check tracked artifacts
+        run: |
+          if git ls-files | grep -E '(^|/)(__pycache__/|.*\.py[co]$|\.DS_Store$)'; then
+            echo "Generated artifacts are tracked in git."
+            exit 1
+          fi
+      - name: Check docs files exist
+        run: |
+          test -f README.md
+          test -f CONTRIBUTING.md
+          test -f SECURITY.md
+          test -f CHANGELOG.md
+          test -f RELEASE_CHECKLIST.md
+          test -f MANIFEST.in
+          test -f skill/SKILL.md
+          test -f skill/manifest.txt
+          test -f docs/USING_WITH_CLAUDE_CODE.md
+          test -f docs/USING_WITH_CODEX_CHATGPT.md
+
+  smoke-tests-macos:
+    runs-on: macos-latest
+    env:
+      MPS_REQUIRED: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "torch>=2.3"
+          python -m pip install --no-build-isolation --no-deps .
+      - name: Run smoke tests
+        run: python -m skill.tests.smoke_test
